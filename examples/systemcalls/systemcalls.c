@@ -1,5 +1,10 @@
 #include "systemcalls.h"
 
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+
 /**
  * @param cmd the command to execute with system()
  * @return true if the command in @param cmd was executed
@@ -16,8 +21,19 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    int status = system(cmd);
 
-    return true;
+    if (status == -1) {
+        /* system() itself failed to create the shell / fork */
+        perror("system");
+        return false;
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return true;
+    }
+
+    return false;
 }
 
 /**
@@ -58,10 +74,35 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    bool result = false;
+
+    /* Flush stdout before forking so buffered output in this process
+     * isn't duplicated if the child also has something pending in its
+     * (copied) stdio buffer. */
+    fflush(stdout);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+    } else if (pid == 0) {
+        /* Child: replace this process image with the requested command.
+         * execv() only returns if it failed. */
+        execv(command[0], command);
+        perror("execv");
+        _exit(1);
+    } else {
+        /* Parent: wait for the specific child we just created. */
+        int status;
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("waitpid");
+        } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            result = true;
+        }
+    }
 
     va_end(args);
 
-    return true;
+    return result;
 }
 
 /**
@@ -92,8 +133,44 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    bool result = false;
+
+    int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        perror("open");
+        va_end(args);
+        return false;
+    }
+
+    fflush(stdout);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        close(fd);
+    } else if (pid == 0) {
+        /* Child: point our stdout at outputfile, then become the command. */
+        if (dup2(fd, STDOUT_FILENO) == -1) {
+            perror("dup2");
+            close(fd);
+            _exit(1);
+        }
+        close(fd);
+        execv(command[0], command);
+        perror("execv");
+        _exit(1);
+    } else {
+        /* Parent doesn't write to the file itself; the child owns that fd now. */
+        close(fd);
+        int status;
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("waitpid");
+        } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            result = true;
+        }
+    }
 
     va_end(args);
 
-    return true;
+    return result;
 }
